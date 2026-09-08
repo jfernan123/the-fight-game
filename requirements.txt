@@ -1,0 +1,6 @@
+mujoco>=3.3.0
+gymnasium
+stable-baselines3
+torch
+tensorboard
+pytest
