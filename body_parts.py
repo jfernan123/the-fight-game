@@ -77,8 +77,8 @@ class Geom:
     Feet carry a custom `friction` (higher than default) so they grip instead of skating.
     """
 
-    type: str                       # "capsule" or "sphere"
-    size: float
+    type: str                       # "capsule", "sphere" or "box"
+    size: object                    # capsule/sphere: one radius. box: (half_x, half_y, half_z).
     mass: float
     rgba: str
     name: str | None = None
@@ -95,7 +95,10 @@ class Geom:
             parts.append(f'fromto="{self.fromto}"')
         if self.pos is not None:
             parts.append(f'pos="{self.pos}"')
-        parts.append(f'size="{_fmt(self.size)}"')
+        if isinstance(self.size, (tuple, list)):
+            parts.append('size="' + " ".join(_fmt(v) for v in self.size) + '"')
+        else:
+            parts.append(f'size="{_fmt(self.size)}"')
         parts.append(f'mass="{_fmt(self.mass)}"')
         if self.friction is not None:
             parts.append(f'friction="{self.friction}"')

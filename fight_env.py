@@ -111,6 +111,10 @@ def _actuators(name: str, ankle_mode: str | None = None) -> str:
     lines.append(f'    <motor name="{name}_waist_bend_m" joint="{name}_waist_bend" gear="300" ctrlrange="-1 1" />')
     for side in ("r", "l"):
         lines.append(f'    <motor name="{name}_hip_{side}_m" joint="{name}_hip_{side}" gear="1500" ctrlrange="-1 1" />')
+        # Unverified first-pass gear, same treatment as the ankle/shoulder_abduct motors -- not yet
+        # swept the way hip/knee were. Weaker than hip flexion (1500) because abduction is a
+        # smaller muscle group and only needs to shift weight, not drive the stride.
+        lines.append(f'    <motor name="{name}_hip_abduct_{side}_m" joint="{name}_hip_abduct_{side}" gear="600" ctrlrange="-1 1" />')
         lines.append(f'    <motor name="{name}_knee_{side}_m" joint="{name}_knee_{side}" gear="1200" ctrlrange="-1 1" />')
     # Ankle gear is an unverified first-pass guess (300), not yet swept the way every other joint
     # above was (see docstring) -- expect this to need the same empirical audit before trusting it.
@@ -190,24 +194,21 @@ EXPLORE_FIGHTERS = ("red",)
 def _self_collision_excludes(name: str) -> str:
     """Body pairs on one fighter that should never collide with each other.
 
-    MuJoCo only auto-excludes DIRECT parent-child body pairs, so an arm swung across the body
-    collides with the chest/head two levels up. That was harmless while the arms were passively
-    spring-held near a fixed guard pose, but once the walker started actuating them (see
-    walk_env.py's BASE_WALK_JOINTS) it became reachable within the arms' own legal ROM --
-    confirmed empirically: driving shoulder/shoulder_abduct/elbow to an extreme produced real
-    contacts between the forearm and both the spine_up and head geoms. Those show up as
-    unexplained contact-force jolts mid-episode, so exclude the pairs outright.
+    Currently empty, deliberately.
 
-    The chest body carries the waist/spine_up/chest/neck/head geoms, so one forearm<->chest
-    exclude covers all of them at once. The upperarm's parent IS the chest (auto-excluded), but
-    the glove/forearm hanging off it is not.
+    This previously excluded the forearms and upperarms from colliding with the chest and pelvis.
+    That was a mistake: arm-versus-torso collision is real physics, and removing it let the
+    forearms pass straight through the body -- measured at 6.7cm of interpenetration with zero
+    contacts generated, which is exactly the "elbows going inside the body" that shows up on
+    screen. The original justification was avoiding "contact-force jolts", but that was a guess,
+    never verified, and it turns out to be wrong: with the exclusions removed the arm generates
+    normal contacts (623 over a 600-step arm-across-body drive), penetration drops to a routine
+    1.9cm of soft-contact depth, constraint forces stay bounded and the state stays finite.
+
+    Kept as a function rather than deleted so there is an obvious place to add a genuine exclusion
+    if one is ever actually needed -- and a record of why blanket-excluding was wrong.
     """
-    lines = []
-    for side in ("r", "l"):
-        lines.append(f'    <exclude body1="{name}_chest" body2="{name}_forearm_{side}" />')
-        lines.append(f'    <exclude body1="{name}" body2="{name}_forearm_{side}" />')
-        lines.append(f'    <exclude body1="{name}" body2="{name}_upperarm_{side}" />')
-    return "\n".join(lines)
+    return ""
 
 
 def _build_model_xml(

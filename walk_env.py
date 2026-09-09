@@ -46,8 +46,10 @@ from gymnasium import spaces
 from fight_env import _actuators, _build_model_xml, _set_rest_pose_qpos
 import reward_terms
 from reward_terms import (
-    COMMAND_MAX_SPEED, COMMAND_MIN_SPEED, COMMAND_RESAMPLE_INTERVAL, GAIT_CYCLE_TIME,
-    NumpyState,
+    COMMAND_MAX_SPEED, COMMAND_MIN_SPEED, COMMAND_RESAMPLE_INTERVAL, COMMAND_STAND_PROB,
+    COMMAND_STAND_SPEED, GAIT_CYCLE_TIME, PUSH_INTERVAL, PUSH_MAX_VEL,
+    STANDING_COMMAND_THRESHOLD,
+    LEG_BALANCE_EMA_ALPHA, NumpyState,
 )
 
 AGENT = "red"
@@ -55,7 +57,7 @@ AGENT = "red"
 # variant -- see _ankle_joint_names below). shoulder_abduct_{side} is the arm's second axis (raising
 # the arm out to the side, not just forward/back) -- see fight_env.py's SHOULDER_ABDUCT_MAX comment.
 BASE_WALK_JOINTS = [
-    "hip_r", "hip_l", "knee_r", "knee_l", "hip_twist",
+    "hip_r", "hip_l", "hip_abduct_r", "hip_abduct_l", "knee_r", "knee_l", "hip_twist",
     "shoulder_r", "shoulder_l", "shoulder_abduct_r", "shoulder_abduct_l", "elbow_r", "elbow_l",
     "waist_twist", "waist_bend",
 ]
@@ -167,6 +169,26 @@ class WalkEnv(gym.Env):
         self._foot_body_id = {
             side: int(self.model.geom_bodyid[geom_ids[0]]) for side, geom_ids in self._foot_geom_ids.items()
         }
+        # Each foot's height when planted at the rest pose. FootClearance measures lift ABOVE
+        # this, so the term reads 0 for a planted foot regardless of the model's absolute
+        # geometry (the foot body sits ~0.10m up even when it's flat on the floor).
+        mujoco.mj_resetData(self.model, self.data)
+        _set_rest_pose_qpos(self.model, self.data, AGENT)
+        mujoco.mj_forward(self.model, self.data)
+        self._foot_rest_sole_z = {side: self._foot_sole_z(side) for side in self._foot_geom_ids}
+        # Knee position = the shin body's origin. KneeLift measures lift above the resting pose.
+        self._knee_body_id = {side: self.model.body(f'{AGENT}_shin_{side}').id for side in ('r', 'l')}
+        self._knee_rest_z = {side: float(self.data.xpos[bid][2]) for side, bid in self._knee_body_id.items()}
+        # Authored joint limits, for JointLimitPenalty. Unlimited joints get +/-inf so they
+        # never contribute.
+        _lo, _hi = [], []
+        for j in self.walk_joints:
+            jid = self.model.joint(f'{AGENT}_{j}').id
+            if self.model.jnt_limited[jid]:
+                _lo.append(float(self.model.jnt_range[jid][0])); _hi.append(float(self.model.jnt_range[jid][1]))
+            else:
+                _lo.append(-np.inf); _hi.append(np.inf)
+        self._joint_lower = np.array(_lo); self._joint_upper = np.array(_hi)
 
         # Every other geom on the body -- thighs, shins, torso, arms, etc. -- for the "did some
         # non-foot part collapse onto the ground" fall check. The whole model is one agent, so
@@ -175,6 +197,26 @@ class WalkEnv(gym.Env):
         self._non_foot_geom_ids = [
             gi for gi in range(self.model.ngeom) if gi != self._floor_geom_id and gi not in _foot_ids_flat
         ]
+        # The shins are split out of the INSTANT-kill set and handled on the debounced path
+        # instead. Measured: the shin capsule has a 6cm radius and its lower end sits at the ankle,
+        # so its bottom hangs only ~3.8cm above the floor in a normal standing pose (vs 34cm for
+        # the thigh). Any crouch deeper than a few centimetres touches it. With instant
+        # termination that was catastrophic -- on a real checkpoint, 40/40 episodes ended by
+        # non-foot contact and 32 of those were killed while still fully upright (chest within
+        # 10 degrees of vertical, torso at 0.71m).
+        # NOTE: this does NOT explain the stiff-legged gait, contrary to a guess made when the bug
+        # was found. Measured directly: flexing the knee RAISES the shin (lowest point +0.040m at
+        # 0 degrees, +0.093m at 45, +0.299m at 90), so knee flexion improves shin clearance rather
+        # than risking it. Shin contact comes from the body sinking on a near-straight leg.
+        # A shin near the ground is anatomy, not a fall. SUSTAINED shin contact (i.e. kneeling)
+        # still ends the episode via the EMA below.
+        _shin_bodies = {self.model.body(f"{AGENT}_shin_{s}").id for s in ("r", "l")}
+        self._shin_geom_ids = [gi for gi in self._non_foot_geom_ids
+                               if self.model.geom_bodyid[gi] in _shin_bodies]
+        # Thigh, torso, arms, head: 34cm+ of clearance, so contact there is a real collapse (it
+        # was the original crouch exploit) and still terminates immediately.
+        self._collapse_geom_ids = [gi for gi in self._non_foot_geom_ids
+                                   if gi not in self._shin_geom_ids]
 
         # Passive (unactuated) pitch/roll DOFs only exist in the model when free_torso=True --
         # not part of the action space, but the policy needs to see them to have any chance of
@@ -189,9 +231,11 @@ class WalkEnv(gym.Env):
         self._prev_action = np.zeros(len(self.walk_joints), dtype=np.float64)
         self._air_time = {"r": 0.0, "l": 0.0}
         self._down_ema = 0.0
+        self._leg_lift_ema = {"r": 0.0, "l": 0.0}
         self._phase = 0.0
         self._target_speed = COMMAND_MIN_SPEED
         self._resample_countdown = 0
+        self._push_countdown = 0
 
         n_obs = len(self._build_observation())
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(n_obs,), dtype=np.float32)
@@ -210,32 +254,55 @@ class WalkEnv(gym.Env):
         self._prev_action = np.zeros(len(self.walk_joints), dtype=np.float64)
         self._air_time = {"r": 0.0, "l": 0.0}
         self._down_ema = 0.0
+        self._leg_lift_ema = {"r": 0.0, "l": 0.0}
         # Randomized (not always 0) so the policy doesn't just learn one fixed phase-to-pose
         # alignment -- same reset-diversity rationale as RESET_QPOS_NOISE_STD.
         self._phase = float(self.np_random.uniform(0.0, 1.0))
-        self._target_speed = float(self.np_random.uniform(COMMAND_MIN_SPEED, COMMAND_MAX_SPEED))
+        self._target_speed = self._sample_command()
         self._resample_countdown = int(COMMAND_RESAMPLE_INTERVAL / self.dt)
+        # Staggered, matching walk_env_gpu.py. Setting this to the full interval instead made the
+        # first push land at exactly step 599 of every single episode -- so the opening 6 seconds
+        # were never disturbed, and a 10s episode saw exactly one push, always at the same moment.
+        self._push_countdown = int(self.np_random.integers(1, int(PUSH_INTERVAL / self.dt) + 1))
         if self.render_mode == "human":
             self._render_frame()
         return self._build_observation(), self._info()
 
     def step(self, action):
-        action = np.clip(np.asarray(action, dtype=np.float64), -1.0, 1.0)
+        # Keep the pre-clamp command: physics only ever sees the clamped value, but the reward
+        # needs the raw one to penalize a policy whose output is running away past the usable
+        # range (see reward_terms.ActionMagnitudePenalty).
+        raw_action = np.asarray(action, dtype=np.float64)
+        action = np.clip(raw_action, -1.0, 1.0)
         for actuator_id, value in zip(self._actuator_ids, action):
             self.data.ctrl[actuator_id] = value
 
         mujoco.mj_step(self.model, self.data)
         self._step_count += 1
-        self._phase = (self._phase + self.dt / GAIT_CYCLE_TIME) % 1.0
+        # The gait clock only runs while there is a gait. Advancing it during a "stand still"
+        # command fed the policy a ticking metronome it had learned means "step now", directly
+        # contradicting the command in the same observation vector -- measured, standing collapsed
+        # from 85% double-support at 2M steps (an inert policy) to 5% once walking was learned, and
+        # then had to slowly re-learn to SUPPRESS the clock rather than simply not receiving it.
+        # Frozen, sin/cos(phase) hold constant and "stand" becomes an unambiguous input.
+        if self._target_speed >= STANDING_COMMAND_THRESHOLD:
+            self._phase = (self._phase + self.dt / GAIT_CYCLE_TIME) % 1.0
+        self._maybe_push()
         self._resample_countdown -= 1
         if self._resample_countdown <= 0:
-            self._target_speed = float(self.np_random.uniform(COMMAND_MIN_SPEED, COMMAND_MAX_SPEED))
+            self._target_speed = self._sample_command()
             self._resample_countdown = int(COMMAND_RESAMPLE_INTERVAL / self.dt)
 
         foot_touching = {side: self._foot_touching_floor(ids) for side, ids in self._foot_geom_ids.items()}
         air_time_before = self._advance_air_time(foot_touching)
         fallen = self._has_fallen()
-        state = self._build_reward_state(action, fallen, foot_touching, air_time_before)
+        # Each leg's own running average lift, for GaitSymmetry. Updated before the reward is
+        # built so both legs' averages reflect this step.
+        for _s, _bid in self._knee_body_id.items():
+            _lift = max(0.0, float(self.data.xpos[_bid][2] - self._knee_rest_z[_s]))
+            self._leg_lift_ema[_s] = (LEG_BALANCE_EMA_ALPHA * _lift
+                                      + (1.0 - LEG_BALANCE_EMA_ALPHA) * self._leg_lift_ema[_s])
+        state = self._build_reward_state(action, fallen, foot_touching, air_time_before, raw_action)
         self.reward_breakdown = {k: float(v) for k, v in reward_terms.breakdown(state).items()}
         reward = float(sum(self.reward_breakdown.values()))
         self._prev_action = action.copy()
@@ -299,14 +366,25 @@ class WalkEnv(gym.Env):
         return abs(pitch_deg) > FALL_ANGLE_DEG or abs(roll_deg) > FALL_ANGLE_DEG or torso_z < FALL_HEIGHT
 
     def _has_fallen(self) -> bool:
-        """Fallen = any non-foot body part touching the ground (INSTANT, no debounce -- a knee or
-        hand on the floor is never a recoverable state), OR a sustained bad orientation/height,
-        debounced via an exponential moving average so a momentary lean gets a recovery window.
-        See FALL_EMA_ALPHA's comment for why these two halves are treated differently."""
-        if self.free_torso and self._non_foot_touching_floor():
+        """Three tiers, because the body parts genuinely differ in what their contact means:
+
+        1. INSTANT -- thigh, torso, arms or head on the ground. Those sit 34cm+ up in a normal
+           stance, so touching the floor is an unambiguous collapse (this is the crouch exploit
+           the check was originally added for). No debounce; any grace period is a loophole.
+        2. DEBOUNCED -- shins on the ground, or bad orientation/height. A shin hangs ~3.8cm off
+           the floor by construction, so brushing it is normal articulation, but *sustained* shin
+           contact is kneeling and should end the episode. Likewise a momentary lean past the
+           fall angle is recoverable; staying there is not.
+        3. Neither -> still standing.
+
+        See the _shin_geom_ids comment in __init__ for the measurements behind the split.
+        """
+        if not self.free_torso:
+            return False
+        if self._geoms_touching_floor(self._collapse_geom_ids):
             return True
-        bad_orientation = self._is_badly_oriented()
-        self._down_ema = FALL_EMA_ALPHA * float(bad_orientation) + (1.0 - FALL_EMA_ALPHA) * self._down_ema
+        down = self._is_badly_oriented() or self._geoms_touching_floor(self._shin_geom_ids)
+        self._down_ema = FALL_EMA_ALPHA * float(down) + (1.0 - FALL_EMA_ALPHA) * self._down_ema
         return self._down_ema >= FALL_EMA_THRESHOLD
 
     def _foot_touching_floor(self, foot_geom_ids: list[int]) -> bool:
@@ -318,15 +396,22 @@ class WalkEnv(gym.Env):
                 return True
         return False
 
-    def _non_foot_touching_floor(self) -> bool:
+    def _geoms_touching_floor(self, geom_ids) -> bool:
+        """Is any geom in `geom_ids` in contact with the floor this step?"""
         for i in range(self.data.ncon):
             contact = self.data.contact[i]
             if self._floor_geom_id not in (contact.geom1, contact.geom2):
                 continue
             other = contact.geom2 if contact.geom1 == self._floor_geom_id else contact.geom1
-            if other in self._non_foot_geom_ids:
+            if other in geom_ids:
                 return True
         return False
+
+    def _non_foot_touching_floor(self) -> bool:
+        """Any non-foot part touching the ground, shins included -- kept for diagnostics and for
+        watch_gpu.py's state dump. The fall decision itself uses the tiered check in _has_fallen,
+        which treats shins differently from thigh/torso/arms."""
+        return self._geoms_touching_floor(self._non_foot_geom_ids)
 
     def _advance_air_time(self, foot_touching: dict[str, bool]) -> dict[str, float]:
         """Update each foot's airborne timer and return what it was BEFORE this step's landing.
@@ -339,6 +424,36 @@ class WalkEnv(gym.Env):
         for side, touching in foot_touching.items():
             self._air_time[side] = 0.0 if touching else self._air_time[side] + self.dt
         return before
+
+    def _geom_lowest_z(self, gid: int) -> float:
+        """Lowest world-z the geom's surface reaches (capsule: nearer endpoint minus radius)."""
+        pos = self.data.geom_xpos[gid]
+        gtype = self.model.geom_type[gid]
+        mat = self.data.geom_xmat[gid].reshape(3, 3)
+        size = self.model.geom_size[gid]
+        if gtype == mujoco.mjtGeom.mjGEOM_CAPSULE:
+            axis = mat[:, 2] * size[1]
+            return float(min((pos + axis)[2], (pos - axis)[2]) - size[0])
+        if gtype == mujoco.mjtGeom.mjGEOM_BOX:
+            # Lowest corner of a rotated box: drop by each half-extent projected onto world z.
+            return float(pos[2] - float(np.abs(mat[2, :3]) @ size[:3]))
+        return float(pos[2] - size[0])
+
+    def _foot_sole_z(self, side: str) -> float:
+        """Height of the SOLE -- the lowest point of this foot's geom(s).
+
+        FootClearance used to read the foot BODY origin, which sits 0.109m above the sole at the
+        heel/ankle end of the capsule. That made the term completely blind to foot orientation:
+        measured directly, swinging the ankle from -24.5 to +53.7 degrees left the reported height
+        pinned at +0.174 and the reward at exactly +0.2400, while the true sole height fell from
+        0.221m to 0.089m. A dragging toe scored the same as a well-cleared foot.
+        Worse, it created a free lunch: toes-up raises the sole (helping avoid the contact that
+        ends episodes) at zero clearance cost, so the policy parked the ankle at -24.9 degrees --
+        past its own -20 degree soft limit -- permanently heel-down.
+        Measuring the sole makes pointing the toe cost real clearance reward, which is what the
+        term was supposed to price all along. For "detailed" feet this spans heel AND toe geoms.
+        """
+        return min(self._geom_lowest_z(gid) for gid in self._foot_geom_ids[side])
 
     def _balance_cost(self) -> float:
         """Squared horizontal distance from the center of mass to the midpoint between the feet --
@@ -365,7 +480,22 @@ class WalkEnv(gym.Env):
         com_ref = self.data.subtree_com[self.model.body_rootid[body_id]]
         return v_com + np.cross(omega, self.data.xipos[body_id] - com_ref)
 
-    def _build_reward_state(self, action, fallen, foot_touching, air_time_before) -> NumpyState:
+    def _sample_command(self) -> float:
+        """A commanded speed, sometimes zero (see COMMAND_STAND_PROB)."""
+        if self.np_random.random() < COMMAND_STAND_PROB:
+            return COMMAND_STAND_SPEED
+        return float(self.np_random.uniform(COMMAND_MIN_SPEED, COMMAND_MAX_SPEED))
+
+    def _maybe_push(self) -> None:
+        """Occasionally shove the torso sideways/forwards so it has to catch itself."""
+        self._push_countdown -= 1
+        if self._push_countdown > 0:
+            return
+        self._push_countdown = int(PUSH_INTERVAL / self.dt)
+        self.data.qvel[self._x_dof] += self.np_random.uniform(-PUSH_MAX_VEL, PUSH_MAX_VEL)
+        self.data.qvel[self._y_dof] += self.np_random.uniform(-PUSH_MAX_VEL, PUSH_MAX_VEL)
+
+    def _build_reward_state(self, action, fallen, foot_touching, air_time_before, raw_action=None) -> NumpyState:
         """Gather everything reward_terms.py needs out of MuJoCo. All the backend-specific reading
         happens here; the terms themselves are shared with the GPU env."""
         chest_pitch, chest_roll = self._chest_world_pitch_roll()
@@ -376,6 +506,7 @@ class WalkEnv(gym.Env):
             vertical_vel=self.data.qvel[self._z_dof],
             action=action,
             prev_action=self._prev_action,
+            raw_action=raw_action,
             joint_accel=np.array([self.data.qacc[d] for d in self._joint_dof_adr]),
             joint_vel=np.array([self.data.qvel[d] for d in self._joint_dof_adr]),
             chest_pitch=chest_pitch,
@@ -386,6 +517,18 @@ class WalkEnv(gym.Env):
             foot_touching=foot_touching,
             air_time=dict(self._air_time),
             air_time_before=air_time_before,
+            leg_lift_ema=dict(self._leg_lift_ema),
+            knee_height={
+                side: float(self.data.xpos[bid][2] - self._knee_rest_z[side])
+                for side, bid in self._knee_body_id.items()
+            },
+            joint_pos=np.array([self.data.qpos[a] for a in self._joint_qpos_adr]),
+            joint_lower=self._joint_lower,
+            joint_upper=self._joint_upper,
+            foot_height={
+                side: self._foot_sole_z(side) - self._foot_rest_sole_z[side]
+                for side in self._foot_geom_ids
+            },
             foot_slip_sq={
                 side: float(np.sum(self._foot_linear_velocity(bid)[:2] ** 2))
                 for side, bid in self._foot_body_id.items()

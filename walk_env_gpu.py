@@ -32,8 +32,10 @@ import warp as wp
 from fight_env import _actuators, _build_model_xml, _set_rest_pose_qpos
 import reward_terms
 from reward_terms import (
-    COMMAND_MAX_SPEED, COMMAND_MIN_SPEED, COMMAND_RESAMPLE_INTERVAL, GAIT_CYCLE_TIME,
-    TorchState,
+    COMMAND_MAX_SPEED, COMMAND_MIN_SPEED, COMMAND_RESAMPLE_INTERVAL, COMMAND_STAND_PROB,
+    COMMAND_STAND_SPEED, GAIT_CYCLE_TIME, PUSH_INTERVAL, PUSH_MAX_VEL,
+    STANDING_COMMAND_THRESHOLD,
+    LEG_BALANCE_EMA_ALPHA, TorchState,
 )
 
 AGENT = "red"
@@ -42,7 +44,7 @@ AGENT = "red"
 # the arm out to the side, not just forward/back) -- see fight_env.py's SHOULDER_ABDUCT_MAX comment
 # and walk_env.py's module docstring for why every actuated DOF is included, not just the legs.
 BASE_WALK_JOINTS = [
-    "hip_r", "hip_l", "knee_r", "knee_l", "hip_twist",
+    "hip_r", "hip_l", "hip_abduct_r", "hip_abduct_l", "knee_r", "knee_l", "hip_twist",
     "shoulder_r", "shoulder_l", "shoulder_abduct_r", "shoulder_abduct_l", "elbow_r", "elbow_l",
     "waist_twist", "waist_bend",
 ]
@@ -141,23 +143,72 @@ class WalkEnvGPU:
         # Owning body of each foot (for the slip penalty's cvel lookup) -- whatever body the first
         # geom on that side belongs to, since a "detailed" foot's heel+toe geoms are on one body.
         self._foot_body_id = {side: int(m.geom_bodyid[ids[0]]) for side, ids in self._foot_geom_ids.items()}
+        # Planted resting height per foot -- FootClearance measures lift above this. Taken from
+        # the same rest-pose mj_data used to seed the sim, so it matches walk_env.py exactly.
+        # Resting SOLE height per foot (lowest point of its geoms) -- FootClearance measures lift
+        # above this. See walk_env.py's _foot_sole_z for why the sole and not the body origin.
+        def _rest_sole(side):
+            lows = []
+            for g in self._foot_geom_ids[side]:
+                pos = mj_data.geom_xpos[g]
+                mat = mj_data.geom_xmat[g].reshape(3, 3)
+                size = m.geom_size[g]
+                if m.geom_type[g] == mujoco.mjtGeom.mjGEOM_CAPSULE:
+                    ax = mat[:, 2] * size[1]
+                    lows.append(min((pos + ax)[2], (pos - ax)[2]) - size[0])
+                elif m.geom_type[g] == mujoco.mjtGeom.mjGEOM_BOX:
+                    lows.append(pos[2] - float(abs(mat[2, :3]) @ size[:3]))
+                else:
+                    lows.append(pos[2] - size[0])
+            return float(min(lows))
+        self._foot_rest_sole_z = {side: _rest_sole(side) for side in self._foot_geom_ids}
+        self._knee_body_id = {side: m.body(f'{AGENT}_shin_{side}').id for side in ('r', 'l')}
+        self._knee_rest_z = {side: float(mj_data.xpos[bid][2]) for side, bid in self._knee_body_id.items()}
+        # Authored joint limits for JointLimitPenalty (unlimited joints get +/-inf).
+        _lo, _hi = [], []
+        for j in self.walk_joints:
+            jid = m.joint(f'{AGENT}_{j}').id
+            if m.jnt_limited[jid]:
+                _lo.append(float(m.jnt_range[jid][0])); _hi.append(float(m.jnt_range[jid][1]))
+            else:
+                _lo.append(float('-inf')); _hi.append(float('inf'))
+        self._joint_lower = torch.tensor(_lo, dtype=torch.float32, device=device)
+        self._joint_upper = torch.tensor(_hi, dtype=torch.float32, device=device)
+        # Per-geom capsule params, cached for the batched sole computation each step.
+        self._foot_geom_params = {
+            side: [(g, [float(v) for v in m.geom_size[g][:3]], int(m.geom_type[g]))
+                   for g in self._foot_geom_ids[side]]
+            for side in self._foot_geom_ids
+        }
+        self._GEOM_CAPSULE = int(mujoco.mjtGeom.mjGEOM_CAPSULE)
+        self._GEOM_BOX = int(mujoco.mjtGeom.mjGEOM_BOX)
         # Root body of each foot's kinematic tree -- the reference point cvel's linear half is
         # expressed at (see _foot_slip_cost).
         self._foot_rootid = {side: int(m.body_rootid[bid]) for side, bid in self._foot_body_id.items()}
 
         _foot_ids_flat = {gid for ids in self._foot_geom_ids.values() for gid in ids}
-        self._non_foot_geom_ids = torch.as_tensor(
-            [gi for gi in range(m.ngeom) if gi != self._floor_geom_id and gi not in _foot_ids_flat],
-            dtype=torch.long, device=device,
-        )
+        _non_foot = [gi for gi in range(m.ngeom) if gi != self._floor_geom_id and gi not in _foot_ids_flat]
+        self._non_foot_geom_ids = torch.as_tensor(_non_foot, dtype=torch.long, device=device)
+        # Shins are debounced rather than instant-kill -- see walk_env.py for the measurements
+        # (a shin hangs ~3.8cm off the floor by construction, so brushing it is normal
+        # articulation, while the thigh sits 34cm up and touching it is a real collapse).
+        _shin_bodies = {m.body(f"{AGENT}_shin_{s}").id for s in ("r", "l")}
+        _shins = [gi for gi in _non_foot if m.geom_bodyid[gi] in _shin_bodies]
+        self._shin_geom_ids = torch.as_tensor(_shins, dtype=torch.long, device=device)
+        self._collapse_geom_ids = torch.as_tensor(
+            [gi for gi in _non_foot if gi not in _shins], dtype=torch.long, device=device)
 
         self._step_count = torch.zeros(num_envs, dtype=torch.int64, device=device)
         self._prev_action = torch.zeros(num_envs, self.action_dim, dtype=torch.float32, device=device)
         self._air_time = {side: torch.zeros(num_envs, dtype=torch.float32, device=device) for side in ("r", "l")}
         self._down_ema = torch.zeros(num_envs, dtype=torch.float32, device=device)
+        self._leg_lift_ema = {side: torch.zeros(num_envs, dtype=torch.float32, device=device)
+                              for side in ('r', 'l')}
         self._phase = torch.zeros(num_envs, dtype=torch.float32, device=device)
         self._target_speed = torch.full((num_envs,), COMMAND_MIN_SPEED, dtype=torch.float32, device=device)
         self._resample_countdown = torch.zeros(num_envs, dtype=torch.int64, device=device)
+        self._push_countdown = torch.randint(
+            1, int(PUSH_INTERVAL / self.dt) + 1, (num_envs,), device=device)
 
         with wp.ScopedDevice(device):
             self.obs_dim = self._compute_observation().shape[1]
@@ -175,20 +226,36 @@ class WalkEnvGPU:
         # on cuda:0 the first time step() ran, even though construction was correctly scoped).
         # Scoping every call that touches mjwarp, not just construction, is what actually pins it.
         with wp.ScopedDevice(self.device):
+            # Pre-clamp command kept for ActionMagnitudePenalty -- see walk_env.py.
+            raw_action = action
             action = torch.clamp(action, -1.0, 1.0)
             ctrl = wp.to_torch(self.d.ctrl)
             ctrl.zero_()
             ctrl[:, self._actuator_ids] = action
 
+            # Push before stepping, so the disturbance is part of the dynamics this action meets.
+            self._maybe_push()
             mjwarp.step(self.m, self.d)
             self._step_count += 1
-            self._phase = (self._phase + self.dt / GAIT_CYCLE_TIME) % 1.0
+            # The gait clock only runs while there is a gait. Advancing it during a "stand still"
+            # command fed the policy a ticking metronome it had learned means "step now", directly
+            # contradicting the command in the same observation vector -- measured, standing collapsed
+            # from 85% double-support at 2M steps (an inert policy) to 5% once walking was learned, and
+            # then had to slowly re-learn to SUPPRESS the clock rather than simply not receiving it.
+            # Frozen, sin/cos(phase) hold constant and "stand" becomes an unambiguous input.
+            walking = (self._target_speed >= STANDING_COMMAND_THRESHOLD).float()
+            self._phase = (self._phase + walking * (self.dt / GAIT_CYCLE_TIME)) % 1.0
             self._resample_command()
 
             foot_touching = self._foot_contact_state()
             air_time_before = self._advance_air_time(foot_touching)
             fallen = self._has_fallen()
-            state = self._build_reward_state(action, fallen, foot_touching, air_time_before)
+            # Per-leg running average lift, for GaitSymmetry (see walk_env.py).
+            _kh = self._knee_heights()
+            for _s in self._leg_lift_ema:
+                self._leg_lift_ema[_s] = (LEG_BALANCE_EMA_ALPHA * torch.clamp(_kh[_s], min=0.0)
+                                          + (1.0 - LEG_BALANCE_EMA_ALPHA) * self._leg_lift_ema[_s])
+            state = self._build_reward_state(action, fallen, foot_touching, air_time_before, raw_action)
             # Per-term values kept for TensorBoard (train_gpu.py logs them) -- two separate bugs
             # this project hit were invisible in the total and obvious per-term.
             self.reward_breakdown = reward_terms.breakdown(state)
@@ -220,14 +287,35 @@ class WalkEnvGPU:
             for side in self._air_time:
                 self._air_time[side][idx] = 0.0
             self._down_ema[idx] = 0.0
+            for _s in self._leg_lift_ema:
+                self._leg_lift_ema[_s][idx] = 0.0
             # Randomized (not always 0) so envs don't all share one fixed phase-to-pose alignment
             # -- same reset-diversity rationale as RESET_QPOS_NOISE_STD.
             self._phase[idx] = torch.rand(idx.numel(), device=self.device)
-            self._target_speed[idx] = torch.empty(idx.numel(), device=self.device).uniform_(
-                COMMAND_MIN_SPEED, COMMAND_MAX_SPEED
-            )
+            self._target_speed[idx] = self._sample_command(idx.numel())
             self._resample_countdown[idx] = int(COMMAND_RESAMPLE_INTERVAL / self.dt)
+            # Staggered so the whole batch doesn't get shoved on the same step.
+            self._push_countdown[idx] = torch.randint(
+                1, int(PUSH_INTERVAL / self.dt) + 1, (idx.numel(),), device=self.device)
             mjwarp.forward(self.m, self.d)
+
+    def _sample_command(self, n: int) -> torch.Tensor:
+        """n commanded speeds, a COMMAND_STAND_PROB fraction of them "stand still" (zero)."""
+        speeds = torch.empty(n, device=self.device).uniform_(COMMAND_MIN_SPEED, COMMAND_MAX_SPEED)
+        stand = torch.rand(n, device=self.device) < COMMAND_STAND_PROB
+        return torch.where(stand, torch.full_like(speeds, COMMAND_STAND_SPEED), speeds)
+
+    def _maybe_push(self) -> None:
+        """Shove the torso of whichever envs are due, so they have to catch themselves."""
+        self._push_countdown -= 1
+        due = self._push_countdown <= 0
+        if not due.any():
+            return
+        idx = due.nonzero(as_tuple=True)[0]
+        qvel = wp.to_torch(self.d.qvel)
+        for dof in (self._x_dof, self._y_dof):
+            qvel[idx, dof] += (torch.rand(idx.numel(), device=self.device) * 2.0 - 1.0) * PUSH_MAX_VEL
+        self._push_countdown[idx] = int(PUSH_INTERVAL / self.dt)
 
     def _resample_command(self) -> None:
         """Ticks the per-env countdown and resamples target_speed for whichever envs hit zero --
@@ -237,9 +325,7 @@ class WalkEnvGPU:
         due = self._resample_countdown <= 0
         if due.any():
             idx = due.nonzero(as_tuple=True)[0]
-            self._target_speed[idx] = torch.empty(idx.numel(), device=self.device).uniform_(
-                COMMAND_MIN_SPEED, COMMAND_MAX_SPEED
-            )
+            self._target_speed[idx] = self._sample_command(idx.numel())
             self._resample_countdown[idx] = int(COMMAND_RESAMPLE_INTERVAL / self.dt)
 
     def _randomize_reset_state(self, qpos: torch.Tensor, qvel: torch.Tensor, idx: torch.Tensor) -> None:
@@ -280,12 +366,14 @@ class WalkEnvGPU:
         return (pitch_deg.abs() > FALL_ANGLE_DEG) | (roll_deg.abs() > FALL_ANGLE_DEG) | (torso_z < FALL_HEIGHT)
 
     def _has_fallen(self) -> torch.Tensor:
-        """Fallen = any non-foot body part touching the ground (INSTANT, no debounce -- a knee or
-        hand on the floor is never recoverable), OR a sustained bad orientation/height, debounced
-        via an EMA. See walk_env.py's FALL_EMA_ALPHA comment for why the halves differ."""
-        bad_orientation = self._is_badly_oriented()
-        self._down_ema = FALL_EMA_ALPHA * bad_orientation.float() + (1.0 - FALL_EMA_ALPHA) * self._down_ema
-        return self._non_foot_touching_floor() | (self._down_ema >= FALL_EMA_THRESHOLD)
+        """Three tiers -- INSTANT for thigh/torso/arms/head on the ground (34cm+ of clearance, so
+        that's an unambiguous collapse), DEBOUNCED for shins (~3.8cm of clearance by construction,
+        so a graze is normal articulation but sustained contact is kneeling) and for bad
+        orientation/height. See walk_env.py's _has_fallen for the full reasoning."""
+        collapsed = self._geoms_touching_floor(self._collapse_geom_ids)
+        down = self._is_badly_oriented() | self._geoms_touching_floor(self._shin_geom_ids)
+        self._down_ema = FALL_EMA_ALPHA * down.float() + (1.0 - FALL_EMA_ALPHA) * self._down_ema
+        return collapsed | (self._down_ema >= FALL_EMA_THRESHOLD)
 
     def _active_contact_mask(self) -> torch.Tensor:
         """Which entries of the flat contact buffer are REAL this step.
@@ -304,19 +392,24 @@ class WalkEnvGPU:
         n_slots = wp.to_torch(self.d.contact.dist).shape[0]
         return torch.arange(n_slots, device=self.device) < nacon
 
-    def _non_foot_touching_floor(self) -> torch.Tensor:
+    def _geoms_touching_floor(self, geom_ids: torch.Tensor) -> torch.Tensor:
+        """Per-env: is any geom in `geom_ids` in contact with the floor this step?"""
         geom = wp.to_torch(self.d.contact.geom)
         worldid = wp.to_torch(self.d.contact.worldid).long()
         active = self._active_contact_mask() & (wp.to_torch(self.d.contact.dist) <= 0.0)
 
         involves_floor = (geom[:, 0] == self._floor_geom_id) | (geom[:, 1] == self._floor_geom_id)
         other = torch.where(geom[:, 0] == self._floor_geom_id, geom[:, 1], geom[:, 0])
-        is_non_foot = torch.isin(other, self._non_foot_geom_ids)
-        mask = active & involves_floor & is_non_foot
+        mask = active & involves_floor & torch.isin(other, geom_ids)
 
         touching = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         touching[worldid[mask]] = True
         return touching
+
+    def _non_foot_touching_floor(self) -> torch.Tensor:
+        """Any non-foot part touching the ground, shins included -- diagnostics only. The fall
+        decision uses the tiered check in _has_fallen."""
+        return self._geoms_touching_floor(self._non_foot_geom_ids)
 
     def _foot_contact_state(self) -> dict[str, torch.Tensor]:
         """Per-env, per-foot touching-the-floor boolean -- computed once per step and shared by
@@ -352,6 +445,36 @@ class WalkEnvGPU:
         feet_xy = torch.stack([xpos[:, bid, :2] for bid in self._foot_body_id.values()], dim=1)
         return ((com_xy - feet_xy.mean(dim=1)) ** 2).sum(dim=-1)
 
+    def _foot_heights(self) -> dict[str, torch.Tensor]:
+        """Per-env SOLE height above its planted resting height (see walk_env.py's _foot_sole_z --
+        measuring the body origin instead made the term blind to foot orientation and let the
+        policy park permanently heel-down for free)."""
+        gxpos = wp.to_torch(self.d.geom_xpos)
+        gxmat = wp.to_torch(self.d.geom_xmat)
+        out = {}
+        for side, params in self._foot_geom_params.items():
+            low = None
+            for gid, size, gtype in params:
+                pos_z = gxpos[:, gid, 2]
+                if gtype == self._GEOM_CAPSULE:
+                    ax_z = gxmat[:, gid, 2, 2] * size[1]  # world z-component of the capsule axis
+                    g_low = torch.minimum(pos_z + ax_z, pos_z - ax_z) - size[0]
+                elif gtype == self._GEOM_BOX:
+                    # lowest corner: each half-extent projected onto world z
+                    drop = sum(gxmat[:, gid, 2, i].abs() * size[i] for i in range(3))
+                    g_low = pos_z - drop
+                else:
+                    g_low = pos_z - size[0]
+                low = g_low if low is None else torch.minimum(low, g_low)
+            out[side] = low - self._foot_rest_sole_z[side]
+        return out
+
+    def _knee_heights(self) -> dict[str, torch.Tensor]:
+        """Per-env knee height above its resting height (see KneeLift)."""
+        xpos = wp.to_torch(self.d.xpos)
+        return {side: xpos[:, bid, 2] - self._knee_rest_z[side]
+                for side, bid in self._knee_body_id.items()}
+
     def _foot_slip_sq(self) -> dict[str, torch.Tensor]:
         """Squared horizontal speed of each foot.
 
@@ -370,7 +493,7 @@ class WalkEnvGPU:
             out[side] = v[:, 0] ** 2 + v[:, 1] ** 2
         return out
 
-    def _build_reward_state(self, action, fallen, foot_touching, air_time_before) -> TorchState:
+    def _build_reward_state(self, action, fallen, foot_touching, air_time_before, raw_action=None) -> TorchState:
         """Gather everything reward_terms.py needs out of MuJoCo Warp. All backend-specific reading
         happens here; the terms themselves are shared with the CPU env."""
         qvel = wp.to_torch(self.d.qvel)
@@ -384,6 +507,7 @@ class WalkEnvGPU:
             vertical_vel=qvel[:, self._z_dof],
             action=action,
             prev_action=self._prev_action,
+            raw_action=raw_action,
             joint_accel=qacc[:, self._joint_dof_adr],
             joint_vel=qvel[:, self._joint_dof_adr],
             chest_pitch=chest_pitch,
@@ -394,6 +518,12 @@ class WalkEnvGPU:
             foot_touching=foot_touching,
             air_time=dict(self._air_time),
             air_time_before=air_time_before,
+            leg_lift_ema=dict(self._leg_lift_ema),
+            knee_height=self._knee_heights(),
+            joint_pos=wp.to_torch(self.d.qpos)[:, self._joint_qpos_adr],
+            joint_lower=self._joint_lower,
+            joint_upper=self._joint_upper,
+            foot_height=self._foot_heights(),
             foot_slip_sq=self._foot_slip_sq(),
             fallen=fallen,
         )

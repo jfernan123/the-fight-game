@@ -55,10 +55,21 @@ LOG_STD_MAX = 2.0
 class ActorCritic(nn.Module):
     def __init__(self, obs_dim: int, action_dim: int, hidden: int = 128) -> None:
         super().__init__()
+        # The final Tanh bounds the policy's MEAN to (-1, 1), the range the environment actually
+        # uses. Without it the mean is free to drift arbitrarily far out: the env clips to +/-1, so
+        # past the clip there is no gradient pulling it back and the mean random-walks outward for
+        # free. Measured on the 788M-step run, that is exactly what happened -- mean |a| reached
+        # 4.31 with a max of 13.10 and 81% of every output beyond the clip, i.e. a policy emitting
+        # bang-bang controls with no graded middle left to balance with. An explicit penalty
+        # (ACTION_SATURATION_WEIGHT) was tried first and measurably only slowed the drift.
+        # Bounding it structurally removes the failure instead of pricing it.
+        #
+        # Only the mean is squashed, so the distribution stays a plain Gaussian over the pre-clip
+        # action and PPO's log-prob needs no change-of-variables correction.
         self.actor_mean = nn.Sequential(
             nn.Linear(obs_dim, hidden), nn.Tanh(),
             nn.Linear(hidden, hidden), nn.Tanh(),
-            nn.Linear(hidden, action_dim),
+            nn.Linear(hidden, action_dim), nn.Tanh(),
         )
         self.actor_log_std = nn.Parameter(torch.zeros(action_dim))
         self.critic = nn.Sequential(

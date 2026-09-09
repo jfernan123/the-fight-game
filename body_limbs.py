@@ -42,6 +42,13 @@ RANGE_SIGN = {"shoulder": 1.0, "elbow": 1.0, "hip": 1.0, "knee": -1.0, "ankle": 
 # Symmetric ranges (no facing mirror needed).
 ANKLE_ROLL_MAX = 20.0        # foot inversion/eversion; only built for ankle_mode "dual"/"detailed"
 SHOULDER_ABDUCT_MAX = 100.0  # arm out to the side -- the motion humans actually balance with
+# Hip abduction/adduction -- swinging the leg out to the side. The legs previously had NO
+# frontal-plane freedom at all: every leg joint (hip, knee, ankle in 'single') was on the sagittal
+# axis, so the whole body's only lateral actuation was the arms. That left torso roll -- one of the
+# two ways it falls -- with no leg-driven correction available, while the balance reward was still
+# asking it to keep its centre of mass over its feet. Humans do that shift almost entirely with the
+# hips. Asymmetric because adduction is limited by the other leg being in the way.
+HIP_ABDUCT_ROM = (45.0, 30.0)   # (abduction out, adduction across) in degrees
 HIP_TWIST_MAX = 60.0         # pelvis yaw
 WAIST_TWIST_MAX = 45.0       # chest yaw relative to pelvis (hip-shoulder separation)
 
@@ -165,7 +172,18 @@ class Leg(Limb):
     shin_length: float = 0.32
     shin_radius: float = 0.06
     shin_mass: float = 5.2
-    foot_radius: float = 0.05
+    # The foot is a BOX, not a capsule. A capsule is round in cross-section, so the old foot was
+    # effectively a 10cm-diameter rolling pin: measured standing, it made a single contact point
+    # with a support patch of 0.0 x 0.0 cm, i.e. no lateral support base at all. A human foot is
+    # ~25 x 9 cm of flat sole. That missing support polygon plausibly underlies a lot of the roll
+    # instability, the rocking onto the heel, and the foot slip.
+    foot_length: float = 0.24     # 24cm, human scale for this body
+    foot_width: float = 0.09
+    foot_height: float = 0.04
+    # The ankle sits ~25% of the foot's length back from the toe, so part of the foot is BEHIND it
+    # (the calcaneus). The old geometry started at the ankle and ran forward only -- no heel at
+    # all, which is what a body needs to not topple backwards.
+    heel_behind_ankle: float = 0.06
     foot_mass: float = 1.7
     foot_friction: str = "1.5 0.005 0.0001"   # grippier than default so feet don't skate
 
@@ -186,20 +204,44 @@ class Leg(Limb):
                   range=f"-{ANKLE_ROLL_MAX} {ANKLE_ROLL_MAX}", **common),
         ]
 
+    @property
+    def sole_z(self) -> float:
+        """Height of the sole below the ankle. Kept equal to the old capsule's lowest point so the
+        body still stands at the same height."""
+        return -0.09
+
     def _foot_geoms(self) -> list[Geom]:
-        p, s = self.prefix, self.side
+        """Flat box sole(s), positioned with a real heel behind the ankle.
+
+        "detailed" splits it at the ball of the foot into hindfoot and forefoot -- the standard
+        two-segment abstraction used in biomechanical gait models (OpenSim et al.), which is what
+        lets the foot roll heel-strike -> flat -> toe-off instead of landing as one rigid slab.
+        The anatomical next step would be an MTP (toe) joint between the two; the split geometry
+        here is the prerequisite for that.
+        """
+        p, s, f = self.prefix, self.side, self.facing
+        hz = self.foot_height / 2
+        cz = self.sole_z + hz                      # box centre so the sole lands at sole_z
+        hy = self.foot_width / 2
+        back = -self.heel_behind_ankle             # heel edge, behind the ankle
+        front = self.foot_length - self.heel_behind_ankle   # toe edge, ahead of it
+
         if self.ankle_mode == "detailed":
+            split = 0.10                            # ball of the foot, ~40% back from the toe
+            hind_c, hind_h = (back + split) / 2, (split - back) / 2
+            fore_c, fore_h = (split + front) / 2, (front - split) / 2
             return [
-                Geom(name=f"{p}_heel_{s}", type="capsule",
-                     fromto=f"0 0 0 {-0.06 * self.facing} 0 -0.02", size=0.045, mass=0.6,
+                Geom(name=f"{p}_heel_{s}", type="box", pos=f"{hind_c * f} 0 {cz}",
+                     size=(hind_h, hy, hz), mass=self.foot_mass * 0.45,
                      friction=self.foot_friction, rgba=self.body_rgba),
-                Geom(name=f"{p}_toe_{s}", type="capsule",
-                     fromto=f"0 0 0 {self.foot_x} 0 -0.04", size=0.045, mass=1.1,
+                Geom(name=f"{p}_toe_{s}", type="box", pos=f"{fore_c * f} 0 {cz}",
+                     size=(fore_h, hy, hz), mass=self.foot_mass * 0.55,
                      friction=self.foot_friction, rgba=self.body_rgba),
             ]
-        return [Geom(name=f"{p}_foot_{s}", type="capsule",
-                     fromto=f"0 0 0 {self.foot_x} 0 -0.04", size=self.foot_radius,
-                     mass=self.foot_mass, friction=self.foot_friction, rgba=self.body_rgba)]
+        centre = (back + front) / 2
+        return [Geom(name=f"{p}_foot_{s}", type="box", pos=f"{centre * f} 0 {cz}",
+                     size=(self.foot_length / 2, hy, hz), mass=self.foot_mass,
+                     friction=self.foot_friction, rgba=self.body_rgba)]
 
     def build(self) -> Segment:
         p, s = self.prefix, self.side
@@ -210,10 +252,12 @@ class Leg(Limb):
         shin_children: list[Segment] = []
         if self.ankle_mode is None:
             # No ankle DOF: the foot is just another geom welded onto the shin.
+            hz = self.foot_height / 2
+            centre = (-self.heel_behind_ankle + (self.foot_length - self.heel_behind_ankle)) / 2
             shin_geoms.append(Geom(
-                name=f"{p}_foot_{s}", type="capsule",
-                fromto=f"0 0 -{self.shin_length} {self.foot_x} 0 -0.36",
-                size=self.foot_radius, mass=self.foot_mass,
+                name=f"{p}_foot_{s}", type="box",
+                pos=f"{centre * self.facing} 0 {-self.shin_length + self.sole_z + hz}",
+                size=(self.foot_length / 2, self.foot_width / 2, hz), mass=self.foot_mass,
                 friction=self.foot_friction, rgba=self.body_rgba))
         else:
             shin_children.append(Segment(
@@ -229,9 +273,18 @@ class Leg(Limb):
         )
         return Segment(
             name=f"{p}_thigh_{s}", pos=f"0 {self.y} {self.hip_pos_z}",
-            joints=[Joint(name=f"{p}_hip_{s}", axis="0 1 0",
-                          range=signed_range(self.facing * RANGE_SIGN["hip"], *ROM["hip"]),
-                          stiffness=800, springref=rest[f"hip_{s}"], damping=180, armature=0.1)],
+            joints=[
+                Joint(name=f"{p}_hip_{s}", axis="0 1 0",
+                      range=signed_range(self.facing * RANGE_SIGN["hip"], *ROM["hip"]),
+                      stiffness=800, springref=rest[f"hip_{s}"], damping=180, armature=0.1),
+                # Abduction is mirrored per side so +ctrl means "out to the side" on BOTH legs:
+                # the joint axis is the same world axis for left and right, so without the flip a
+                # single sign would abduct one leg and adduct the other.
+                Joint(name=f"{p}_hip_abduct_{s}", axis="1 0 0",
+                      range=(f"-{HIP_ABDUCT_ROM[0]} {HIP_ABDUCT_ROM[1]}" if s == "r"
+                             else f"-{HIP_ABDUCT_ROM[1]} {HIP_ABDUCT_ROM[0]}"),
+                      stiffness=300, springref=0, damping=40, armature=0.1),
+            ],
             geoms=[Geom(type="capsule", fromto=f"0 0 0 0 0 -{self.thigh_length}",
                         size=self.thigh_radius, mass=self.thigh_mass, rgba=self.body_rgba)],
             children=[shin],
